@@ -1,2 +1,3 @@
 *.session
 process/config/
+*.session-journal
