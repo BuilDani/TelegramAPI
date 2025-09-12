@@ -1013,33 +1013,123 @@ async def convert_all_blocks(status_label, input_dir="process/input", base_name=
         await convert_block_file(status_label, txt_path, json_path, client_for_lookup)
     ui_update_label(status_label, "All txt blocks converted to JSON in process/input.")
 
-async def add_all_blocks_coordinator(status_label, input_dir="process/input", output_dir=OUTPUT_DIR, group_link=GROUP_LINK):
+async def add_all_to_group(status_label, input_dir="process/input", output_dir=OUTPUT_DIR, group_link=None):
     """
     Process all userBase*.json found in process/input sequentially (one file at a time).
-    After each JSON is fully added, move it to process/output to mark processed.
+    For each JSON block:
+    - Read users from the JSON file
+    - Attempt to add each user to the specified group
+    - Separate users into: added (successful), failed (error/no ID), pending (privacy restrictions)
+    - Save results to separate JSON files in output directory
+    - Move processed JSON to output to mark as completed
     """
     if not clients:
         ui_update_label(status_label, "No clients available to add users.")
         return
+    if not group_link:
+        ui_update_label(status_label, "No group link provided.")
+        return
+
     json_blocks = find_input_json_blocks(input_dir=input_dir, base_name="userBase")
     if not json_blocks:
         ui_update_label(status_label, "No JSON blocks found in process/input.")
         return
 
-    for json_path in json_blocks:
-        ui_update_label(status_label, f"Adding users from {os.path.basename(json_path)} ...")
-        # reuse existing coordinator (it partitions users among clients)
-        await add_users_coordinator(status_label, add_list_path=json_path, group_link=group_link)
-        # after processing, move JSON to output (archive processed)
+    master_client = clients[0][0]
+    try:
+        group_entity = await master_client.get_entity(group_link)
+    except Exception as e:
+        ui_update_label(status_label, f"Could not resolve group {group_link}: {e}")
+        return
+
+    total_blocks = len(json_blocks)
+    for block_idx, json_path in enumerate(json_blocks, start=1):
+        ui_update_label(status_label, f"Processing block {block_idx}/{total_blocks}: {os.path.basename(json_path)}")
+
+        # Load users from this JSON block
         try:
-            os.makedirs(output_dir, exist_ok=True)
+            with open(json_path, "r", encoding="utf-8") as f:
+                user_list = json.load(f)
+        except Exception as e:
+            ui_update_label(status_label, f"Error loading {json_path}: {e}")
+            continue
+
+        if not user_list:
+            ui_update_label(status_label, f"Block {os.path.basename(json_path)} is empty, skipping...")
+            continue
+
+        # Separate users by status for processing
+        added_users = []
+        failed_users = []
+        pending_users = []
+
+        # Process each user in the block
+        for user in user_list:
+            username = user.get("username")
+            uid = user.get("id")
+            status = user.get("status", "pending")
+
+            # Skip users that are already successfully added
+            if status == "added":
+                added_users.append(user)
+                continue
+
+            # Skip users with no ID
+            if not uid:
+                user["status"] = "failed"
+                user["message_send"] = "No user ID found"
+                failed_users.append(user)
+                continue
+
+            # For pending users, attempt to add them
+            if status == "pending":
+                try:
+                    await master_client(InviteToChannelRequest(channel=group_entity, users=[uid]))
+                    user["status"] = "added"
+                    added_users.append(user)
+                    ui_update_label(status_label, f"Added {username} to group")
+                except UserPrivacyRestrictedError:
+                    user["status"] = "pending"
+                    user["message_send"] = "User privacy prevents adding"
+                    pending_users.append(user)
+                    ui_update_label(status_label, f"Privacy restriction for {username} - kept pending")
+                except Exception as e:
+                    user["status"] = "failed"
+                    user["message_send"] = str(e)
+                    failed_users.append(user)
+                    ui_update_label(status_label, f"Failed to add {username}: {e}")
+
+                # Small delay to avoid rate limits
+                await asyncio.sleep(1.0)
+
+        # Save results to separate files
+        block_name = Path(json_path).stem
+        os.makedirs(output_dir, exist_ok=True)
+
+        if added_users:
+            added_path = os.path.join(output_dir, f"{block_name}_added.json")
+            safe_write_json(added_path, added_users)
+            ui_update_label(status_label, f"Saved {len(added_users)} added users to {block_name}_added.json")
+
+        if failed_users:
+            failed_path = os.path.join(output_dir, f"{block_name}_failed.json")
+            safe_write_json(failed_path, failed_users)
+            ui_update_label(status_label, f"Saved {len(failed_users)} failed users to {block_name}_failed.json")
+
+        if pending_users:
+            pending_path = os.path.join(output_dir, f"{block_name}_pending.json")
+            safe_write_json(pending_path, pending_users)
+            ui_update_label(status_label, f"Saved {len(pending_users)} pending users to {block_name}_pending.json")
+
+        # Move processed JSON to output directory
+        try:
             dest = os.path.join(output_dir, os.path.basename(json_path))
             shutil.move(json_path, dest)
-            ui_update_label(status_label, f"Moved {os.path.basename(json_path)} -> {output_dir}")
+            ui_update_label(status_label, f"Moved processed block {os.path.basename(json_path)} to output")
         except Exception as e:
             ui_update_label(status_label, f"Could not move {json_path} to output: {e}")
 
-    ui_update_label(status_label, "All JSON blocks processed and moved to output.")
+    ui_update_label(status_label, f"All {total_blocks} blocks processed! Check output directory for results.")
 
 def build_ui():
     root = Tk()
@@ -1055,6 +1145,12 @@ def build_ui():
     lbl_input_dir = Label(frame_files, text="Input dir: process/input (expects userBase*.txt/json)")
     lbl_input_dir.pack(anchor="w", padx=8, pady=(8,0))
 
+    lbl_group_link = Label(frame_files, text="Group Link:")
+    lbl_group_link.pack(anchor="w", padx=8, pady=(8,0))
+    entry_group_link = Entry(frame_files, width=50)
+    entry_group_link.insert(0, GROUP_LINK)  # default value
+    entry_group_link.pack(anchor="w", padx=8, pady=(0,8))
+
     lbl_status_files = Label(frame_files, text="Ready", font=("Arial", 12))
     lbl_status_files.pack(pady=6)
     log_files = scrolledtext.ScrolledText(frame_files, height=14)
@@ -1065,15 +1161,19 @@ def build_ui():
         ui_append_text(log_files, "[+] Scheduled txt -> json (blocks)")
         schedule_coro(convert_all_blocks(lbl_status_files))
 
-    def on_add_blocks_clicked():
+    def on_add_users_clicked():
+        group_link = entry_group_link.get().strip()
+        if not group_link:
+            ui_update_label(lbl_status_files, "Please enter a valid group link.")
+            return
         ui_update_label(lbl_status_files, "Scheduling add of all json blocks (process/input)...")
-        ui_append_text(log_files, "[+] Scheduled Add All Blocks")
-        schedule_coro(add_all_blocks_coordinator(lbl_status_files))
+        ui_append_text(log_files, "[+] Scheduled Add All to GROUP")
+        schedule_coro(add_all_to_group(lbl_status_files, group_link=group_link))
 
     btn_convert_blocks = Button(frame_files, text="Txt -> JSON Blocks", command=on_convert_blocks_clicked, fg="blue")
     btn_convert_blocks.pack(pady=6, padx=8, anchor="w")
-    btn_add_blocks = Button(frame_files, text="Add All Blocks", command=on_add_blocks_clicked, fg="blue")
-    btn_add_blocks.pack(pady=6, padx=8, anchor="w")
+    btn_add_users = Button(frame_files, text="Add All Users", command=on_add_users_clicked, fg="blue")
+    btn_add_users.pack(pady=6, padx=8, anchor="w")
 
     # --- Tab 2: Send Messages (kept similar) ---
     frame_send = Frame(notebook)
