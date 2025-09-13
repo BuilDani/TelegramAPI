@@ -20,6 +20,142 @@ import math
 
 load_dotenv()
 
+CLIENT_FLOOD = {}
+
+def is_valid_username(name):
+    name = name.strip()
+    if not name:
+        return False
+    words = name.split()
+    if len(words) > 2:
+        return False
+    if re.match(r'^[\+\d\s\-\(\)]+$', name):
+        return False
+    if not re.match(r'^[a-zA-Z0-9_.-]+$', name):
+        return False
+    return True
+
+async def filter_and_delete_duplicates(status_label):
+    # Load existing added and pending users to skip
+    added_users = set()
+    pending_users = set()
+    added_path = os.path.join(OUTPUT_DIR, "added.json")
+    if os.path.exists(added_path):
+        try:
+            with open(added_path, "r", encoding="utf-8") as f:
+                added_data = json.load(f)
+                added_users = {u.get("username") for u in added_data if u.get("username")}
+        except Exception:
+            pass
+    pending1_path = os.path.join(OUTPUT_DIR, "pending1.json")
+    if os.path.exists(pending1_path):
+        try:
+            with open(pending1_path, "r", encoding="utf-8") as f:
+                pending_data = json.load(f)
+                pending_users.update({u.get("username") for u in pending_data if u.get("username")})
+        except Exception:
+            pass
+    pending2_path = os.path.join(OUTPUT_DIR, "pending2.json")
+    if os.path.exists(pending2_path):
+        try:
+            with open(pending2_path, "r", encoding="utf-8") as f:
+                pending_data = json.load(f)
+                pending_users.update({u.get("username") for u in pending_data if u.get("username")})
+        except Exception:
+            pass
+
+    txt_blocks = find_input_txt_blocks()
+    for txt_path in txt_blocks:
+        ui_update_label(status_label, f"Filtering {os.path.basename(txt_path)}")
+        try:
+            with open(txt_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception as e:
+            ui_update_label(status_label, f"Error reading {txt_path}: {e}")
+            continue
+        original = [line.strip() for line in lines if line.strip()]
+        valid = []
+        deleted = []
+        seen = set()
+        for name in original:
+            if name in added_users:
+                deleted.append(name)
+                ui_append_text(log_files, f"Deleted already added: {name}")
+                continue
+            if name in pending_users:
+                deleted.append(name)
+                ui_append_text(log_files, f"Deleted pending: {name}")
+                continue
+            if not is_valid_username(name):
+                deleted.append(name)
+                ui_append_text(log_files, f"Deleted invalid: {name}")
+                continue
+            if name in seen:
+                deleted.append(name)
+                ui_append_text(log_files, f"Deleted duplicate: {name}")
+                continue
+            seen.add(name)
+            valid.append(name)
+        # Write back valid
+        try:
+            with open(txt_path, "w", encoding="utf-8") as f:
+                for name in valid:
+                    f.write(name + "\n")
+        except Exception as e:
+            ui_update_label(status_label, f"Error writing {txt_path}: {e}")
+        ui_update_label(status_label, f"Filtered {os.path.basename(txt_path)}: kept {len(valid)}, deleted {len(deleted)}")
+    ui_update_label(status_label, "Filter completed!")
+
+async def add_single_file(status_label, txt_path, group_link):
+    if not clients:
+        ui_update_label(status_label, "No clients available to add users.")
+        return
+    master_client = clients[0][0]
+    try:
+        group_entity = await master_client.get_entity(group_link)
+    except Exception as e:
+        ui_update_label(status_label, f"Could not resolve group {group_link}: {e}")
+        return
+    await process_single_file(clients, txt_path, status_label, group_entity)
+
+async def add_to_group(status_label, group_link, selected_client=None):
+    txt_blocks = find_input_txt_blocks()
+    if not txt_blocks:
+        ui_update_label(status_label, "No input txt blocks found.")
+        return
+    if not clients:
+        ui_update_label(status_label, "No clients available to add users.")
+        return
+    if not group_link:
+        ui_update_label(status_label, "No group link provided.")
+        return
+    master_client = clients[0][0]
+    try:
+        group_entity = await master_client.get_entity(group_link)
+    except Exception as e:
+        ui_update_label(status_label, f"Could not resolve group {group_link}: {e}")
+        return
+    # Determine clients to use
+    if selected_client:
+        clients_to_use = [(c, s) for c, s in clients if c == selected_client]
+        # If selected client, assign all files to it
+        assigned_files = txt_blocks
+        worker_tasks = []
+        for txt_path in assigned_files:
+            task = asyncio.create_task(process_single_file(clients_to_use, txt_path, status_label, group_entity))
+            worker_tasks.append(task)
+    else:
+        clients_to_use = clients
+        # Assign txt files to clients (one per client, if more clients than files, extra do nothing)
+        assigned_files = txt_blocks[:len(clients_to_use)]
+        worker_tasks = []
+        for (client_obj, session_name), txt_path in zip(clients_to_use, assigned_files):
+            task = asyncio.create_task(process_single_file([(client_obj, session_name)] + [(c, s) for c, s in clients_to_use if s != session_name], txt_path, status_label, group_entity))
+            worker_tasks.append(task)
+    # If more files than clients, process remaining sequentially with first client or something, but for now, ignore extra files
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
+    ui_update_label(status_label, "Add completed!")
+
 
 # Config / defaults
 
@@ -27,7 +163,7 @@ CUSTOM_TEXT_PATH = "custom/custom_text.txt"
 ADDUSERLIST = "process/input/userBase.json"
 OUTPUT_DIR = "process/output"
 CLIENTS_CONFIG = "process/config/clients.json"  # optional file listing multiple clients
-GROUP_LINK = "https://t.me/yourgroup"  # substitute with real link or user input in UI
+GROUP_LINK = "https://t.me/chatterspalace"  # substitute with real link or user input in UI
 
 FALLBACK_API_ID = os.getenv("api_id")
 FALLBACK_API_HASH = os.getenv("api_hash")
@@ -39,6 +175,8 @@ def ui_update_label(label: Label, text: str):
     if not label:
         return
     label.after(0, lambda: label.config(text=text))
+    if log_files:
+        ui_append_text(log_files, text)
 
 def ui_append_text(widget: Text, text: str):
     if not widget:
@@ -47,6 +185,20 @@ def ui_append_text(widget: Text, text: str):
         widget.insert(END, text + "\n")
         widget.see(END)
     widget.after(0, _append)
+
+def format_time(seconds):
+    if seconds <= 0:
+        return "0s"
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    parts = []
+    if days: parts.append(f"{days}d")
+    if hours: parts.append(f"{hours}h")
+    if minutes: parts.append(f"{minutes}m")
+    if secs: parts.append(f"{secs}s")
+    return " ".join(parts)
 
 
 # Asyncio loop em thread separada
@@ -179,6 +331,7 @@ async def start_all_clients():
                 await client.start()
                 who = await client.get_me()
                 print(f"[+] Client started: {session} ({who.username} | {who.id})")
+                ui_append_text(log_files, f"[+] Client started: {session} ({who.username} | {who.id})")
                 clients.append((client, session))
                 # small pause between starting clients to reduce DB contention
                 await asyncio.sleep(0.5)
@@ -189,6 +342,7 @@ async def start_all_clients():
                 if "database is locked" in msg or "database is busy" in msg:
                     wait = int(backoff_base ** attempt)
                     print(f"[WARN] sqlite locked when starting {session}, retry {attempt}/{max_retries}, sleeping {wait}s")
+                    ui_append_text(log_files, f"[WARN] sqlite locked when starting {session}, retry {attempt}/{max_retries}, sleeping {wait}s")
                     await asyncio.sleep(wait)
                     continue
                 else:
@@ -199,19 +353,42 @@ async def start_all_clients():
                 # retry on transient errors a few times, otherwise log and continue to next client
                 if attempt < max_retries:
                     wait = int(backoff_base ** attempt)
-                    print(f"[WARN] start client {session} failed (attempt {attempt}), retrying in {wait}s: {e}")
-                    await asyncio.sleep(wait)
-                    continue
+                print(f"[WARN] start client {session} failed (attempt {attempt}), retrying in {wait}s: {e}")
+                ui_append_text(log_files, f"[WARN] start client {session} failed (attempt {attempt}), retrying in {wait}s: {e}")
+                await asyncio.sleep(wait)
+                continue
                 print(f"[ERROR] Failed to start client {session} after {max_retries} attempts: {e}")
+                ui_append_text(log_files, f"[ERROR] Failed to start client {session} after {max_retries} attempts: {e}")
                 break
         if not started:
             print(f"[WARN] Skipping client {session} after failed start attempts.")
+            ui_append_text(log_files, f"[WARN] Skipping client {session} after failed start attempts.")
             # ensure client disconnected/cleanup if partially started
             try:
                 await client.disconnect()
             except Exception:
                 pass
     print(f"[INFO] start_all_clients complete. clients available: {len(clients)}")
+    ui_append_text(log_files, f"[INFO] start_all_clients complete. clients available: {len(clients)}")
+
+    # Debug: print all clients loaded
+    for client_obj, session_name in clients:
+        try:
+            who = await client_obj.get_me()
+            print(f"[DEBUG] Loaded client: {session_name} ({who.username} | {who.id})")
+            ui_append_text(log_files, f"[DEBUG] Loaded client: {session_name} ({who.username} | {who.id})")
+        except Exception as e:
+            print(f"[DEBUG] Error getting client info for {session_name}: {e}")
+            ui_append_text(log_files, f"[DEBUG] Error getting client info for {session_name}: {e}")
+
+    # Update combos after clients are loaded
+    def update_combos():
+        if 'client_combo_files' in globals() and client_combo_files:
+            client_combo_files['values'] = ["All"] + [s for c, s in clients]
+        if 'client_combo_send' in globals() and client_combo_send:
+            client_combo_send['values'] = ["All"] + [s for c, s in clients]
+    if 'ui_root' in globals() and ui_root:
+        ui_root.after(0, update_combos)
 
 
 # Schedule coroutines on clients
@@ -301,6 +478,13 @@ except Exception as e:
 async def fetch_user_ids_async(client_obj, status_label, user_list, output_path=None):
     total = len(user_list)
 
+    # Find session_name for this client
+    session_name = None
+    for c, s in clients:
+        if c == client_obj:
+            session_name = s
+            break
+
     # load existing on-disk map once (username -> entry) to avoid re-resolving IDs
     disk_map = {}
     if output_path and os.path.exists(output_path):
@@ -382,16 +566,14 @@ async def fetch_user_ids_async(client_obj, status_label, user_list, output_path=
                 sec = int(getattr(e, "seconds", 0) or 0)
                 if sec <= 0:
                     sec = parse_floodwait_seconds(str(e)) or 30
+                CLIENT_FLOOD[session_name] = int(time.time()) + sec
+                save_state()
                 ui_update_label(status_label, f"[{idx}/{total}] FloodWait resolving {username}: waiting {sec}s (not persisted)...")
-                for remaining in range(sec, 0, -1):
-                    if STOP_EVENT.is_set():
-                        ui_update_label(status_label, "Stopped by user during wait (fetch ids).")
-                        break
-                    ui_update_label(status_label, f"[{idx}/{total}] FloodWait resolving {username}: {remaining}s")
-                    await asyncio.sleep(1)
-                if STOP_EVENT.is_set():
-                    break
-                continue
+                # Stop the entire process on flood wait to avoid marking all users as failed
+                ui_update_label(status_label, f"FloodWait detected. Stopping all operations to prevent failures.")
+                schedule_coro(start_flood_countdown(session_name, sec, status_label))
+                request_stop_from_ui(status_label)
+                return user_list
             except Exception as e:
                 # detect textual "A wait of N seconds" pattern in some errors
                 sec = parse_floodwait_seconds(str(e))
@@ -413,7 +595,7 @@ async def fetch_user_ids_async(client_obj, status_label, user_list, output_path=
                         pass
                 break
 
-        await asyncio.sleep(0.2)
+            await asyncio.sleep(0.2)
     ui_update_label(status_label, "Convert finished!")
     return user_list
 
@@ -465,29 +647,32 @@ async def convert_async(status_label, input_path="process/input/userBase.txt", o
         client_for_lookup = clients[0][0]
     user_list = await fetch_user_ids_async(client_for_lookup, status_label, user_list, output_path=output_path)
 
-    # MERGE: não sobrescrever disco apenas com user_list parcial — mesclar com o que está em disco
+    # Separate valid and invalid users
+    valid_users = []
+    invalid_users = []
+    for u in user_list:
+        if u.get("id") and u.get("status") == "pending":
+            valid_users.append(u)
+        else:
+            invalid_users.append(u)
+
+    # Save valid users to output_path (ADDUSERLIST)
     try:
-        disk_entries = []
-        if os.path.exists(output_path):
-            with open(output_path, "r", encoding="utf-8") as fr:
-                disk_entries = json.load(fr) or []
-        disk_map = {u.get("username"): u for u in disk_entries if u.get("username")}
-        # update disk_map with our in-memory results
-        for u in user_list:
-            if u.get("username"):
-                disk_map[u["username"]] = u
-        merged = list(disk_map.values())
-        safe_write_json(output_path, merged)
+        safe_write_json(output_path, valid_users)
     except Exception:
         pass
 
-    ui_update_label(status_label, f"Saved {len(user_list)} users to {output_path}")
+    # Save invalid users to a separate file
+    invalid_path = os.path.join(os.path.dirname(output_path), "userBase_invalid.json")
+    try:
+        safe_write_json(invalid_path, invalid_users)
+    except Exception:
+        pass
+
+    ui_update_label(status_label, f"Saved {len(valid_users)} valid users to {output_path} and {len(invalid_users)} invalid users to {invalid_path}")
 
 
 # Add users
-
-# novo: controle de flood por cliente (timestamp unix until)
-CLIENT_FLOOD = {}  # session_name -> unix_ts_until
 
 async def add_users_worker(client_obj, users_subset, status_label, group_entity, all_users_ref, add_list_path, session_name=None):
     added, failed, pending = [], [], []
@@ -555,15 +740,35 @@ async def add_users_worker(client_obj, users_subset, status_label, group_entity,
                     # mark client flood until timestamp so UI can show it
                     if session_name:
                         CLIENT_FLOOD[session_name] = int(time.time()) + sec
-                    # wait in-memory, do not persist flood state
-                    ui_update_label(status_label, f"[{i}/{total}] FloodWait on {session_name}: waiting {sec}s for {username} (not persisted)...")
-                    for remaining in range(sec, 0, -1):
-                        ui_update_label(status_label, f"[{i}/{total}] [{session_name}] FloodWait: {remaining}s")
-                        await asyncio.sleep(1)
-                    # flood expired: clear marker
-                    if session_name and session_name in CLIENT_FLOOD:
-                        CLIENT_FLOOD.pop(session_name, None)
-                    continue
+                        save_state()
+                    # stop the entire process on flood wait to avoid marking all users as failed
+                    ui_update_label(status_label, f"FloodWait detected on {session_name}. Stopping all operations to prevent failures.")
+                    schedule_coro(start_flood_countdown(session_name, sec, status_label))
+                    request_stop_from_ui(status_label)
+                    break
+                except ValueError as e:
+                    # Handle "Could not find the input entity" error specifically
+                    msg = str(e)
+                    if "Could not find the input entity" in msg:
+                        user["status"] = "failed"
+                        user["message_send"] = "Could not find input entity"
+                        failed.append(user)
+                        ui_update_label(status_label, f"[-] Failed {username} by {session_name}: Could not find input entity")
+                        try:
+                            update_user_in_json(add_list_path, username, lambda existing: {**existing, **user})
+                        except Exception:
+                            pass
+                        break
+                    else:
+                        user["status"] = "failed"
+                        user["message_send"] = msg
+                        failed.append(user)
+                        ui_update_label(status_label, f"[-] Failed {username} by {session_name}: {msg}")
+                        try:
+                            update_user_in_json(add_list_path, username, lambda existing: {**existing, **user})
+                        except Exception:
+                            pass
+                        break
                 except Exception as e:
                     user["status"] = "failed"
                     user["message_send"] = str(e)
@@ -607,8 +812,17 @@ async def add_users_coordinator(status_label, add_list_path=ADDUSERLIST, group_l
     master_client = clients[0][0]
     try:
         group_entity = await master_client.get_entity(group_link)
+        # Debug: print group entity type and attributes
+        print(f"[DEBUG] group_entity type: {type(group_entity)}")
+        print(f"[DEBUG] group_entity attributes: {dir(group_entity)}")
+        # Validate entity type: must be channel or megagroup
+        if not (hasattr(group_entity, 'megagroup') or hasattr(group_entity, 'broadcast') or hasattr(group_entity, 'gigagroup')):
+            ui_update_label(status_label, f"Invalid group entity type for {group_link}. Must be a channel or megagroup.")
+            return
     except Exception as e:
         ui_update_label(status_label, f"Could not resolve group {group_link}: {e}")
+        # Stop the entire process on group resolution failure to avoid marking all users as failed
+        request_stop_from_ui(status_label)
         return
 
     ui_update_label(status_label, f"Starting adding {len(user_list)} users using {len(clients)} accounts...")
@@ -659,6 +873,13 @@ async def send_messages_worker(client_obj, users, messages_list, status_label, g
     sent, failed = [], []
     total = len(users)
 
+    # Find session_name for this client
+    session_name = None
+    for c, s in clients:
+        if c == client_obj:
+            session_name = s
+            break
+
     # register this worker
     current_task = asyncio.current_task()
     if current_task not in RUNNING_TASKS:
@@ -691,25 +912,13 @@ async def send_messages_worker(client_obj, users, messages_list, status_label, g
                 sent.append(user)
                 ui_update_label(status_label, f"[{i}/{total}] Sent to {username}")
             except FloodWaitError as e:
-                wait_time = getattr(e, "seconds", 30)
-                for remaining in range(int(wait_time), 0, -1):
-                    if STOP_EVENT.is_set():
-                        ui_update_label(status_label, "Stopped by user during FloodWait (send).")
-                        break
-                    ui_update_label(status_label, f"[!] FloodWait while sending: waiting {remaining}s")
-                    await asyncio.sleep(1)
-                if STOP_EVENT.is_set():
-                    break
-                # retry after wait
-                try:
-                    await client_obj.send_message(uid, msg)
-                    user["message_send"] = "sent"
-                    sent.append(user)
-                    ui_update_label(status_label, f"[retry] Sent to {username}")
-                except Exception as e2:
-                    user["message_send"] = f"failed: {e2}"
-                    failed.append(user)
-                    ui_update_label(status_label, f"[-] Failed send {username}: {e2}")
+                sec = int(getattr(e, "seconds", 30) or 30)
+                CLIENT_FLOOD[session_name] = int(time.time()) + sec
+                save_state()
+                ui_update_label(status_label, f"FloodWait detected on {session_name} during send. Stopping all operations. Wait {sec}s then resume.")
+                schedule_coro(start_flood_countdown(session_name, sec, status_label))
+                request_stop_from_ui(status_label)
+                break
             except Exception as e:
                 user["message_send"] = f"failed: {e}"
                 failed.append(user)
@@ -739,6 +948,40 @@ RUNNING_TASKS = []
 # novo: rastrear última operação para Resume universal
 LAST_OPERATION = None        # valores: "convert", "add", "send"
 LAST_OP_ARGS = {}            # dicionário com argumentos para re-agendamento
+
+# Persistência do estado para resume entre sessões
+STATE_FILE = "process/state.json"
+
+def save_state():
+    state = {
+        "last_operation": LAST_OPERATION,
+        "last_op_args": LAST_OP_ARGS,
+        "client_flood": CLIENT_FLOOD
+    }
+    try:
+        safe_write_json(STATE_FILE, state)
+    except Exception:
+        pass
+
+def load_state():
+    global LAST_OPERATION, LAST_OP_ARGS, CLIENT_FLOOD
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+                LAST_OPERATION = state.get("last_operation")
+                LAST_OP_ARGS = state.get("last_op_args", {})
+                CLIENT_FLOOD = state.get("client_flood", {})
+                # clean expired floods
+                now = time.time()
+                for k, v in list(CLIENT_FLOOD.items()):
+                    if v <= now:
+                        del CLIENT_FLOOD[k]
+        except Exception:
+            pass
+
+# global para log widget
+log_files = None
 
 async def stop_all_operations_async():
     """
@@ -821,7 +1064,7 @@ def schedule_add_users(status_label):
     ui_update_label(status_label, "Scheduling add users...")
     schedule_coro(add_users_coordinator(status_label, add_list_path=ADDUSERLIST, group_link=GROUP_LINK))
 
-def schedule_send_messages(status_label, messages_list, link_text):
+def schedule_send_messages(status_label, messages_list, link_text, selected_client=None):
     if not clients:
         ui_update_label(status_label, "No clients available to send messages.")
         return
@@ -830,29 +1073,45 @@ def schedule_send_messages(status_label, messages_list, link_text):
         return
     global LAST_OPERATION, LAST_OP_ARGS
     LAST_OPERATION = "send"
-    LAST_OP_ARGS = {"messages_list": messages_list, "link_text": link_text}
+    LAST_OP_ARGS = {"messages_list": messages_list, "link_text": link_text, "selected_client": selected_client}
     ui_update_label(status_label, "Scheduling send messages...")
-    schedule_coro(send_messages_coordinator(status_label, messages_list, link_text))
+    schedule_coro(send_messages_coordinator(status_label, messages_list, link_text, selected_client))
 
 
 # Coordinator for sending messages
 
-async def send_messages_coordinator(status_label, messages_list, link_text, add_list_path=ADDUSERLIST):
+async def send_messages_coordinator(status_label, messages_list, link_text, selected_client=None):
     if not clients:
         ui_update_label(status_label, "No clients available to send messages.")
         return
-    if not os.path.exists(add_list_path):
-        ui_update_label(status_label, f"User list not found: {add_list_path}")
+
+    # Load users from pending lists
+    pending1_path = os.path.join(OUTPUT_DIR, "pending1.json")
+    pending2_path = os.path.join(OUTPUT_DIR, "pending2.json")
+    user_list = []
+    for path in [pending1_path, pending2_path]:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    user_list.extend(data)
+            except Exception:
+                pass
+    if not user_list:
+        ui_update_label(status_label, "No pending users found to send messages.")
         return
 
-    with open(add_list_path, "r", encoding="utf-8") as f:
-        user_list = json.load(f)
+    # Determine clients to use
+    if selected_client:
+        clients_to_use = [(c, s) for c, s in clients if c == selected_client]
+    else:
+        clients_to_use = clients
 
-    ui_update_label(status_label, f"Starting sending messages to {len(user_list)} users using {len(clients)} accounts...")
-    parts = partition_users_evenly(user_list, len(clients))
+    ui_update_label(status_label, f"Starting sending messages to {len(user_list)} users using {len(clients_to_use)} accounts...")
+    parts = partition_users_evenly(user_list, len(clients_to_use))
     worker_tasks = []
     failed_path = os.path.join(OUTPUT_DIR, "user_failed_send.json")
-    for (client_obj, session_name), users_subset in zip(clients, parts):
+    for (client_obj, session_name), users_subset in zip(clients_to_use, parts):
         if not users_subset:
             continue
         task = asyncio.create_task(send_messages_worker(client_obj, users_subset, messages_list, status_label, link_text, user_list, failed_path))
@@ -867,9 +1126,16 @@ async def send_messages_coordinator(status_label, messages_list, link_text, add_
         agg_sent.extend(r.get("sent", []))
         agg_failed.extend(r.get("failed", []))
 
+    # Filter remaining users (not sent)
+    remaining_users = [u for u in user_list if u.get("message_send") != "sent"]
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     try:
-        safe_write_json(os.path.join(OUTPUT_DIR, "user_sent.json"), agg_sent)
+        safe_write_json(os.path.join(OUTPUT_DIR, "pending.json"), remaining_users)
+    except Exception:
+        pass
+    try:
+        safe_write_json(os.path.join(OUTPUT_DIR, "sended.json"), agg_sent)
     except Exception:
         pass
     try:
@@ -877,7 +1143,7 @@ async def send_messages_coordinator(status_label, messages_list, link_text, add_
     except Exception:
         pass
 
-    ui_update_label(status_label, f"Send process finished! sent={len(agg_sent)} failed={len(agg_failed)}")
+    ui_update_label(status_label, f"Send process finished! sent={len(agg_sent)} failed={len(agg_failed)} remaining={len(remaining_users)}")
 
 def find_input_txt_blocks(input_dir="process/input", base_name="userBase"):
     """
@@ -969,7 +1235,7 @@ async def convert_block_file(status_label, input_txt_path, output_json_path, cli
     # resolve ids (one-by-one) and persist per-user into output_json_path
     await fetch_user_ids_async(client_for_lookup, status_label, user_list, output_path=output_json_path)
 
-    # ensure merged final JSON in input folder
+    # ensure merged final JSON in input folder, but separate valid and failed
     try:
         disk_entries = []
         if os.path.exists(output_json_path):
@@ -980,7 +1246,13 @@ async def convert_block_file(status_label, input_txt_path, output_json_path, cli
             if u.get("username"):
                 disk_map2[u["username"]] = u
         merged = list(disk_map2.values())
-        safe_write_json(output_json_path, merged)
+        # separate valid (pending with id) and failed
+        valid = [u for u in merged if u.get("id") and u.get("status") == "pending"]
+        failed = [u for u in merged if not (u.get("id") and u.get("status") == "pending")]
+        safe_write_json(output_json_path, valid)
+        if failed:
+            failed_path = output_json_path.replace('.json', '_failed.json')
+            safe_write_json(failed_path, failed)
     except Exception:
         pass
 
@@ -993,35 +1265,233 @@ async def convert_block_file(status_label, input_txt_path, output_json_path, cli
     except Exception:
         pass
 
-async def convert_all_blocks(status_label, input_dir="process/input", base_name="userBase"):
+async def process_single_file(clients_list, txt_path, status_label, group_entity):
     """
-    Find all input txt blocks and convert each to a JSON placed next to the txt
-    (process/input/userBaseN.json). Uses first available client for lookups.
+    Process a single txt file: read users, remove duplicates, skip if already added.
+    Resume from last processed if progress file exists.
+    For each user: resolve ID using first client, if no ID ignore.
+    If ID, try add using available clients (skip flooded).
+    If added, add to added.json.
+    If privacy, add to pending1.json.
+    If other error, add to pending2.json.
+    Stop on flood.
+    Update label with remaining count.
+    Save progress after each user.
+    Don't remove from txt, keep all.
     """
-    txt_blocks = find_input_txt_blocks(input_dir=input_dir, base_name=base_name)
+    try:
+        with open(txt_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception as e:
+        ui_update_label(status_label, f"Error reading {txt_path}: {e}")
+        return
+
+    users = [line.strip() for line in lines if line.strip()]
+    # Remove duplicates
+    users = list(dict.fromkeys(users))
+
+    # Load existing added to skip
+    added_path = os.path.join(OUTPUT_DIR, "added.json")
+    added_users = set()
+    if os.path.exists(added_path):
+        try:
+            with open(added_path, "r", encoding="utf-8") as f:
+                added_data = json.load(f)
+                added_users = {u.get("username") for u in added_data if u.get("username")}
+        except Exception:
+            pass
+
+    # Load progress to resume
+    progress_path = txt_path + ".progress"
+    start_index = 0
+    if os.path.exists(progress_path):
+        try:
+            with open(progress_path, "r", encoding="utf-8") as f:
+                last_username = f.read().strip()
+                if last_username in users:
+                    start_index = users.index(last_username) + 1
+        except Exception:
+            pass
+
+    total_users = len(users)
+    processed_count = start_index
+
+    for i in range(start_index, len(users)):
+        username = users[i]
+        if STOP_EVENT.is_set():
+            break
+
+        # Skip already added
+        if username in added_users:
+            processed_count += 1
+            continue
+
+        remaining_count = total_users - processed_count
+        ui_update_label(status_label, f"Processing {username} - {remaining_count} users left")
+
+        # Resolve ID using available clients, skipping flooded
+        uid = None
+        for client_obj_resolve, session_name_resolve in clients_list:
+            if CLIENT_FLOOD.get(session_name_resolve, 0) > time.time():
+                continue
+            try:
+                entity = await client_obj_resolve.get_entity(username)
+                uid = entity.id
+                break
+            except FloodWaitError as e:
+                sec = int(getattr(e, "seconds", 30) or 30)
+                CLIENT_FLOOD[session_name_resolve] = int(time.time()) + sec
+                save_state()
+                ui_update_label(status_label, f"FloodWait detected on {session_name_resolve} during ID resolve. Skipping this client.")
+                schedule_coro(start_flood_countdown(session_name_resolve, sec, status_label))
+                continue
+            except Exception as e:
+                # Failed to resolve with this client, try next
+                continue
+        if uid is None:
+            # Failed to resolve with any client, ignore, keep in txt
+            processed_count += 1
+            # Save progress
+            try:
+                with open(progress_path, "w", encoding="utf-8") as f:
+                    f.write(username)
+            except Exception:
+                pass
+            continue
+
+        # Add to group using available clients
+        added = False
+        for client_obj, session_name in clients_list:
+            if CLIENT_FLOOD.get(session_name, 0) > time.time():
+                continue
+            try:
+                await client_obj(InviteToChannelRequest(channel=group_entity, users=[uid]))
+                # Added successfully, add to added.json
+                added_entry = {"username": username, "id": uid}
+                try:
+                    if os.path.exists(added_path):
+                        with open(added_path, "r", encoding="utf-8") as f:
+                            added_data = json.load(f)
+                    else:
+                        added_data = []
+                    added_data.append(added_entry)
+                    safe_write_json(added_path, added_data)
+                    added_users.add(username)  # Update set
+                except Exception:
+                    pass
+                ui_update_label(status_label, f"Added {username} by {session_name}")
+                added = True
+                break
+            except UserPrivacyRestrictedError:
+                # Privacy, add to pending1.json
+                pending1_path = os.path.join(OUTPUT_DIR, "pending1.json")
+                pending_entry = {"username": username, "id": uid, "reason": "privacy"}
+                try:
+                    if os.path.exists(pending1_path):
+                        with open(pending1_path, "r", encoding="utf-8") as f:
+                            pending_data = json.load(f)
+                    else:
+                        pending_data = []
+                    pending_data.append(pending_entry)
+                    safe_write_json(pending1_path, pending_data)
+                except Exception:
+                    pass
+                ui_update_label(status_label, f"Pending: privacy for {username}")
+                added = True
+                break
+            except FloodWaitError as e:
+                sec = int(getattr(e, "seconds", 30) or 30)
+                CLIENT_FLOOD[session_name] = int(time.time()) + sec
+                save_state()
+                ui_update_label(status_label, f"FloodWait detected on {session_name} during add. Waiting {sec}s then resume.")
+                schedule_coro(start_flood_countdown(session_name, sec, status_label))
+                # Continue to next client
+                continue
+            except Exception as e:
+                # Other error, add to pending2.json
+                pending2_path = os.path.join(OUTPUT_DIR, "pending2.json")
+                pending_entry = {"username": username, "id": uid, "reason": "error", "error": str(e)}
+                try:
+                    if os.path.exists(pending2_path):
+                        with open(pending2_path, "r", encoding="utf-8") as f:
+                            pending_data = json.load(f)
+                    else:
+                        pending_data = []
+                    pending_data.append(pending_entry)
+                    safe_write_json(pending2_path, pending_data)
+                except Exception:
+                    pass
+                ui_update_label(status_label, f"Failed {username}: {e}")
+                added = True
+                break
+
+        processed_count += 1
+        # Save progress
+        try:
+            with open(progress_path, "w", encoding="utf-8") as f:
+                f.write(username)
+        except Exception:
+            pass
+
+        # Sleep between users
+        await asyncio.sleep(random.uniform(4.0, 10.0))
+
+    # Don't move txt to processed, keep it
+    ui_update_label(status_label, f"Finished processing {os.path.basename(txt_path)}")
+
+async def process_and_add_all_blocks(status_label, input_dir="process/input", output_dir=OUTPUT_DIR, group_link=None):
+    """
+    Optimized: assign each client a separate txt file, process users one by one: resolve ID, add, delete from txt if added.
+    Stop all on flood wait.
+    """
+    txt_blocks = find_input_txt_blocks(input_dir=input_dir, base_name="userBase")
     if not txt_blocks:
         ui_update_label(status_label, "No input txt blocks found.")
         return
     if not clients:
-        ui_update_label(status_label, "No clients available to resolve IDs (start clients first).")
+        ui_update_label(status_label, "No clients available to add users.")
         return
-    client_for_lookup = clients[0][0]
-    for txt_path in txt_blocks:
-        stem = Path(txt_path).stem  # e.g., userBase or userBase1
-        json_name = f"{stem}.json"
-        json_path = os.path.join(input_dir, json_name)
-        await convert_block_file(status_label, txt_path, json_path, client_for_lookup)
-    ui_update_label(status_label, "All txt blocks converted to JSON in process/input.")
+    if not group_link:
+        ui_update_label(status_label, "No group link provided.")
+        return
+
+    master_client = clients[0][0]
+    try:
+        group_entity = await master_client.get_entity(group_link)
+    except Exception as e:
+        ui_update_label(status_label, f"Could not resolve group {group_link}: {e}")
+        return
+
+    # Assign txt files to clients (one per client, if more clients than files, extra do nothing)
+    assigned_files = txt_blocks[:len(clients)]
+
+    worker_tasks = []
+    for (client_obj, session_name), txt_path in zip(clients, assigned_files):
+        task = asyncio.create_task(process_single_file([(client_obj, session_name)], txt_path, status_label, group_entity))
+        worker_tasks.append(task)
+
+    # If more files than clients, process remaining sequentially with first client or something, but for now, ignore extra files
+    # User said each account works on a different .txt, so assume equal or less.
+
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+    ui_update_label(status_label, "All assigned files processed!")
+
+async def start_flood_countdown(session_name, sec, status_label):
+    for remaining in range(sec, 0, -1):
+        ui_update_label(status_label, f"FloodWait on {session_name}: {remaining}s remaining")
+        await asyncio.sleep(1)
+    ui_update_label(status_label, f"FloodWait on {session_name}: expired, can resume")
 
 async def add_all_to_group(status_label, input_dir="process/input", output_dir=OUTPUT_DIR, group_link=None):
     """
     Process all userBase*.json found in process/input sequentially (one file at a time).
     For each JSON block:
     - Read users from the JSON file
-    - Attempt to add each user to the specified group
-    - Separate users into: added (successful), failed (error/no ID), pending (privacy restrictions)
+    - Attempt to add each user to the specified group using multiple accounts
+    - Separate users into: added (successful), failed (error/no ID), pending (privacy restrictions or flood)
     - Save results to separate JSON files in output directory
-    - Move processed JSON to output to mark as completed
+    - Move processed JSON to process/processed to mark as completed
     """
     if not clients:
         ui_update_label(status_label, "No clients available to add users.")
@@ -1042,6 +1512,9 @@ async def add_all_to_group(status_label, input_dir="process/input", output_dir=O
         ui_update_label(status_label, f"Could not resolve group {group_link}: {e}")
         return
 
+    processed_dir = os.path.join("process", "processed")
+    os.makedirs(processed_dir, exist_ok=True)
+
     total_blocks = len(json_blocks)
     for block_idx, json_path in enumerate(json_blocks, start=1):
         ui_update_label(status_label, f"Processing block {block_idx}/{total_blocks}: {os.path.basename(json_path)}")
@@ -1058,84 +1531,81 @@ async def add_all_to_group(status_label, input_dir="process/input", output_dir=O
             ui_update_label(status_label, f"Block {os.path.basename(json_path)} is empty, skipping...")
             continue
 
-        # Separate users by status for processing
-        added_users = []
-        failed_users = []
-        pending_users = []
-
-        # Process each user in the block
-        for user in user_list:
-            username = user.get("username")
-            uid = user.get("id")
-            status = user.get("status", "pending")
-
-            # Skip users that are already successfully added
-            if status == "added":
-                added_users.append(user)
+        # Partition users among clients
+        parts = partition_users_evenly(user_list, len(clients))
+        worker_tasks = []
+        for (client_obj, session_name), users_subset in zip(clients, parts):
+            if not users_subset:
                 continue
+            task = asyncio.create_task(add_users_worker(client_obj, users_subset, status_label, group_entity, user_list, json_path, session_name=session_name))
+            worker_tasks.append(task)
 
-            # Skip users with no ID
-            if not uid:
-                user["status"] = "failed"
-                user["message_send"] = "No user ID found"
-                failed_users.append(user)
+        results = await asyncio.gather(*worker_tasks, return_exceptions=True)
+        agg_added, agg_failed, agg_pending = [], [], []
+        for r in results:
+            if isinstance(r, Exception):
+                ui_update_label(status_label, f"Worker error: {r}")
                 continue
-
-            # For pending users, attempt to add them
-            if status == "pending":
-                try:
-                    await master_client(InviteToChannelRequest(channel=group_entity, users=[uid]))
-                    user["status"] = "added"
-                    added_users.append(user)
-                    ui_update_label(status_label, f"Added {username} to group")
-                except UserPrivacyRestrictedError:
-                    user["status"] = "pending"
-                    user["message_send"] = "User privacy prevents adding"
-                    pending_users.append(user)
-                    ui_update_label(status_label, f"Privacy restriction for {username} - kept pending")
-                except Exception as e:
-                    user["status"] = "failed"
-                    user["message_send"] = str(e)
-                    failed_users.append(user)
-                    ui_update_label(status_label, f"Failed to add {username}: {e}")
-
-                # Small delay to avoid rate limits
-                await asyncio.sleep(1.0)
+            agg_added.extend(r.get("added", []))
+            agg_failed.extend(r.get("failed", []))
+            agg_pending.extend(r.get("pending", []))
 
         # Save results to separate files
         block_name = Path(json_path).stem
         os.makedirs(output_dir, exist_ok=True)
 
-        if added_users:
-            added_path = os.path.join(output_dir, f"{block_name}_added.json")
-            safe_write_json(added_path, added_users)
-            ui_update_label(status_label, f"Saved {len(added_users)} added users to {block_name}_added.json")
+        if agg_added:
+            safe_write_json(os.path.join(output_dir, f"{block_name}_added.json"), agg_added)
+            ui_update_label(status_label, f"Saved {len(agg_added)} added users to {block_name}_added.json")
 
-        if failed_users:
-            failed_path = os.path.join(output_dir, f"{block_name}_failed.json")
-            safe_write_json(failed_path, failed_users)
-            ui_update_label(status_label, f"Saved {len(failed_users)} failed users to {block_name}_failed.json")
+        if agg_failed:
+            safe_write_json(os.path.join(output_dir, f"{block_name}_failed.json"), agg_failed)
+            ui_update_label(status_label, f"Saved {len(agg_failed)} failed users to {block_name}_failed.json")
 
-        if pending_users:
-            pending_path = os.path.join(output_dir, f"{block_name}_pending.json")
-            safe_write_json(pending_path, pending_users)
-            ui_update_label(status_label, f"Saved {len(pending_users)} pending users to {block_name}_pending.json")
+        if agg_pending:
+            safe_write_json(os.path.join(output_dir, f"{block_name}_pending.json"), agg_pending)
+            ui_update_label(status_label, f"Saved {len(agg_pending)} pending users to {block_name}_pending.json")
 
-        # Move processed JSON to output directory
+        # Move processed JSON to processed directory
         try:
-            dest = os.path.join(output_dir, os.path.basename(json_path))
+            dest = os.path.join(processed_dir, os.path.basename(json_path))
             shutil.move(json_path, dest)
-            ui_update_label(status_label, f"Moved processed block {os.path.basename(json_path)} to output")
+            ui_update_label(status_label, f"Moved processed block {os.path.basename(json_path)} to process/processed")
         except Exception as e:
-            ui_update_label(status_label, f"Could not move {json_path} to output: {e}")
+            ui_update_label(status_label, f"Could not move {json_path} to processed: {e}")
 
     ui_update_label(status_label, f"All {total_blocks} blocks processed! Check output directory for results.")
 
+async def ensure_client_connected(client_obj, session_name, status_label):
+    try:
+        connected = await client_obj.is_connected()
+        ui_update_label(status_label, f"Client {session_name} is_connected: {connected}")
+        if not connected:
+            ui_update_label(status_label, f"Client {session_name} not connected, connecting...")
+            await client_obj.connect()
+            connected = await client_obj.is_connected()
+            ui_update_label(status_label, f"Client {session_name} connected after connect(): {connected}")
+        authorized = await client_obj.is_user_authorized()
+        ui_update_label(status_label, f"Client {session_name} is_user_authorized: {authorized}")
+        if not authorized:
+            ui_update_label(status_label, f"Client {session_name} not authorized, please login.")
+            return False
+        if connected and authorized:
+            ui_update_label(status_label, f"Client {session_name} connected and authorized.")
+            return True
+        else:
+            ui_update_label(status_label, f"Client {session_name} connection or authorization failed.")
+            return False
+    except Exception as e:
+        ui_update_label(status_label, f"Error connecting client {session_name}: {e}")
+        return False
+
 def build_ui():
-    root = Tk()
-    root.title("Telegram Multi-Account Adder")
-    root.geometry("1000x720")
-    notebook = ttk.Notebook(root)
+    global tree_clients, client_combo_files, client_combo_send, ui_root
+    ui_root = Tk()
+    ui_root.title("Telegram Multi-Account Adder")
+    ui_root.geometry("1000x720")
+    notebook = ttk.Notebook(ui_root)
     notebook.pack(expand=True, fill="both", padx=8, pady=8)
 
     # --- Tab 1: Files / Actions ---
@@ -1151,27 +1621,106 @@ def build_ui():
     entry_group_link.insert(0, GROUP_LINK)  # default value
     entry_group_link.pack(anchor="w", padx=8, pady=(0,8))
 
+    lbl_client_files = Label(frame_files, text="Select Client:")
+    lbl_client_files.pack(anchor="w", padx=8, pady=(8,0))
+    client_options = ["All"] + [s for c, s in clients] if clients else ["All"]
+    client_combo_files = ttk.Combobox(frame_files, values=client_options, state="readonly")
+    client_combo_files.set("All")
+    client_combo_files.pack(anchor="w", padx=8, pady=(0,8))
+
     lbl_status_files = Label(frame_files, text="Ready", font=("Arial", 12))
     lbl_status_files.pack(pady=6)
     log_files = scrolledtext.ScrolledText(frame_files, height=14)
     log_files.pack(fill="both", padx=8, pady=6, expand=True)
 
-    def on_convert_blocks_clicked():
-        ui_update_label(lbl_status_files, "Scheduling convert of all txt blocks...")
-        ui_append_text(log_files, "[+] Scheduled txt -> json (blocks)")
-        schedule_coro(convert_all_blocks(lbl_status_files))
+    def on_filter_clicked():
+        schedule_coro(filter_and_delete_duplicates(lbl_status_files))
 
-    def on_add_users_clicked():
+    btn_filter = Button(frame_files, text="Filter Duplicates", command=on_filter_clicked)
+    btn_filter.pack(pady=6, padx=8, anchor="w")
+
+    def on_add_group_clicked():
+        global clients
         group_link = entry_group_link.get().strip()
         if not group_link:
             ui_update_label(lbl_status_files, "Please enter a valid group link.")
             return
-        ui_update_label(lbl_status_files, "Scheduling add of all json blocks (process/input)...")
-        ui_append_text(log_files, "[+] Scheduled Add All to GROUP")
-        schedule_coro(add_all_to_group(lbl_status_files, group_link=group_link))
 
-    btn_process_and_add = Button(frame_files, text="Process & Add Users", command=on_process_and_add_clicked, fg="blue")
-    btn_process_and_add.pack(pady=6, padx=8, anchor="w")
+        selected_client_name = client_combo_files.get()
+        selected_client_obj = None
+        if selected_client_name != "All":
+            for c, s in clients:
+                if s == selected_client_name:
+                    selected_client_obj = c
+                    break
+
+        # Check for flooded clients
+        flooded_clients = []
+        for session_name, flood_until in CLIENT_FLOOD.items():
+            rem = max(0, int(flood_until - time.time()))
+            if rem > 0:
+                flooded_clients.append(session_name)
+
+        if selected_client_name != "All":
+            if selected_client_name in flooded_clients:
+                ui_update_label(lbl_status_files, f"Selected client {selected_client_name} is flooded. Please wait.")
+                return
+        else:
+            if flooded_clients:
+                ui_update_label(lbl_status_files, f"Some clients are flooded: {', '.join(flooded_clients)}. Proceeding with available clients.")
+
+        async def add_group_task():
+            # Determine clients to use
+            if selected_client_obj:
+                clients_to_use = [(c, s) for c, s in clients if c == selected_client_obj]
+            else:
+                clients_to_use = clients[:]
+
+            # Debug: log initial clients to use
+            ui_update_label(lbl_status_files, f"[DEBUG] Initial clients to use: {[s for c, s in clients_to_use]}")
+
+            # Ensure only the clients to use are connected
+            connected_clients = []
+            for client_obj, session_name in clients_to_use:
+                connected = await ensure_client_connected(client_obj, session_name, lbl_status_files)
+                if connected:
+                    connected_clients.append((client_obj, session_name))
+                else:
+                    ui_update_label(lbl_status_files, f"Client {session_name} not connected or authorized. Attempting to connect...")
+                    # Try to connect again
+                    try:
+                        await client_obj.connect()
+                        authorized = await client_obj.is_user_authorized()
+                        if authorized:
+                            connected_clients.append((client_obj, session_name))
+                            ui_update_label(lbl_status_files, f"Client {session_name} connected and authorized after retry.")
+                        else:
+                            ui_update_label(lbl_status_files, f"Client {session_name} still not authorized after retry.")
+                    except Exception as e:
+                        ui_update_label(lbl_status_files, f"Error connecting client {session_name} on retry: {e}")
+
+            ui_update_label(lbl_status_files, f"[DEBUG] Connected clients: {[s for c, s in connected_clients]}")
+            if not connected_clients:
+                ui_update_label(lbl_status_files, "No connected clients available to add users.")
+                return
+
+            # Check if selected client is connected
+            if selected_client_obj and selected_client_obj not in [c for c, s in connected_clients]:
+                ui_update_label(lbl_status_files, "Selected client could not be connected. Please check the client status.")
+                return
+
+            # Temporarily update global clients for add_to_group, but restore after
+            original_clients = clients[:]
+            clients[:] = connected_clients
+            try:
+                await add_to_group(lbl_status_files, group_link, selected_client_obj)
+            finally:
+                clients[:] = original_clients
+
+        schedule_coro(add_group_task())
+
+    btn_add_group = Button(frame_files, text="Add to Group", command=on_add_group_clicked)
+    btn_add_group.pack(pady=6, padx=8, anchor="w")
 
     # --- Tab 2: Send Messages (kept similar) ---
     frame_send = Frame(notebook)
@@ -1180,6 +1729,12 @@ def build_ui():
     lbl_messages.pack(anchor="w", padx=8, pady=(8,0))
     txt_messages = scrolledtext.ScrolledText(frame_send, height=12)
     txt_messages.pack(fill="both", padx=8, pady=6, expand=True)
+    lbl_client = Label(frame_send, text="Select Client:")
+    lbl_client.pack(anchor="w", padx=8, pady=(8,0))
+    client_options = ["All"] + [s for c, s in clients] if clients else ["All"]
+    client_combo_send = ttk.Combobox(frame_send, values=client_options, state="readonly")
+    client_combo_send.set("All")
+    client_combo_send.pack(anchor="w", padx=8, pady=(0,8))
     lbl_status_send = Label(frame_send, text="Ready", font=("Arial", 12))
     lbl_status_send.pack(pady=6)
     def on_send_clicked():
@@ -1188,7 +1743,14 @@ def build_ui():
         if not lines:
             ui_update_label(lbl_status_send, "No messages to send.")
             return
-        schedule_send_messages(lbl_status_send, lines, GROUP_LINK)
+        selected_client_name = client_combo_send.get()
+        selected_client_obj = None
+        if selected_client_name != "All":
+            for c, s in clients:
+                if s == selected_client_name:
+                    selected_client_obj = c
+                    break
+        schedule_send_messages(lbl_status_send, lines, GROUP_LINK, selected_client_obj)
     btn_send = Button(frame_send, text="Send Messages", command=on_send_clicked)
     btn_send.pack(pady=6, padx=8, anchor="w")
 
@@ -1197,47 +1759,44 @@ def build_ui():
     notebook.add(frame_clients, text="Clients")
     lbl_clients = Label(frame_clients, text="Clients / Flood status:")
     lbl_clients.pack(anchor="w", padx=8, pady=(8,0))
-    txt_clients = scrolledtext.ScrolledText(frame_clients, height=18)
-    txt_clients.pack(fill="both", padx=8, pady=6, expand=True)
+    tree_clients = ttk.Treeview(frame_clients, columns=("Client", "Status", "Flood Time"), show="headings")
+    tree_clients.heading("Client", text="Client")
+    tree_clients.heading("Status", text="Status")
+    tree_clients.heading("Flood Time", text="Flood Time")
+    tree_clients.pack(fill="both", padx=8, pady=6, expand=True)
 
-    async def clients_status_loop():
-        while True:
-            lines = []
+    return ui_root
+
+async def clients_status_loop():
+    while True:
+        def _set():
+            for item in tree_clients.get_children():
+                tree_clients.delete(item)
             if not clients:
-                lines.append("No clients started.")
+                tree_clients.insert("", "end", values=("No clients started.", "", ""))
             else:
                 for client_obj, session_name in clients:
                     flood_until = CLIENT_FLOOD.get(session_name)
                     status = "OK"
+                    rem = None
                     if flood_until:
                         rem = max(0, int(flood_until - time.time()))
-                        status = f"FLOODED ({rem}s)"
-                    # try to show username/id if available
-                    try:
-                        who = None
-                        # avoid blocking: use cached session name only
-                        lines.append(f"{session_name}: {status}")
-                    except Exception:
-                        lines.append(f"{session_name}: {status}")
-            def _set():
-                txt_clients.delete("1.0", END)
-                for L in lines:
-                    txt_clients.insert(END, L + "\n")
-                txt_clients.see(END)
-            txt_clients.after(0, _set)
-            await asyncio.sleep(2)
-
-    try:
-        schedule_coro(clients_status_loop())
-    except Exception:
-        pass
-
-    return root
+                        if rem > 0:
+                            status = "FLOODED"
+                        else:
+                            # flood expired, clear marker
+                            CLIENT_FLOOD.pop(session_name, None)
+                    tree_clients.insert("", "end", values=(session_name, status, format_time(rem) if rem is not None else ""))
+        tree_clients.after(0, _set)
+        await asyncio.sleep(2)
 
 
 # Main
 
 if __name__ == "__main__":
+    # Load persisted state on startup
+    load_state()
+
     # Construir UI e proteger com try/except para capturar erros que impedem a abertura da janela
     try:
         print("[INFO] Building UI...")
@@ -1248,6 +1807,12 @@ if __name__ == "__main__":
             schedule_coro(start_all_clients())
         except Exception as e:
             print("[WARN] scheduling start_all_clients_safe failed:", e)
+
+        # schedule clients status update loop
+        try:
+            schedule_coro(clients_status_loop())
+        except Exception as e:
+            print("[WARN] scheduling clients_status_loop failed:", e)
 
         print("[INFO] Starting Tk mainloop...")
 
@@ -1267,6 +1832,7 @@ if __name__ == "__main__":
                     loop.call_soon_threadsafe(loop.stop)
                 except Exception:
                     pass
+                save_state()
                 ui_root.destroy()
 
             ui_root.after(500, try_shutdown)

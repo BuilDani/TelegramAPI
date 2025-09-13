@@ -1,0 +1,37 @@
+[
+    {
+        "username": "@catcommisar",
+        "id": 6689229944,
+        "reason": "error",
+        "error": "The provided user is not a mutual contact (caused by InviteToChannelRequest)",
+        "message_send": "sent"
+    },
+    {
+        "username": "@intoy147",
+        "id": 6388786776,
+        "reason": "error",
+        "error": "The provided user is not a mutual contact (caused by InviteToChannelRequest)",
+        "message_send": "sent"
+    },
+    {
+        "username": "@Kornsofly",
+        "id": 1598481561,
+        "reason": "error",
+        "error": "The provided user is not a mutual contact (caused by InviteToChannelRequest)",
+        "message_send": "sent"
+    },
+    {
+        "username": "@drrntym",
+        "id": 5942930762,
+        "reason": "error",
+        "error": "The provided user is not a mutual contact (caused by InviteToChannelRequest)",
+        "message_send": "sent"
+    },
+    {
+        "username": "@elyrobs23",
+        "id": 6808658782,
+        "reason": "error",
+        "error": "The provided user is not a mutual contact (caused by InviteToChannelRequest)",
+        "message_send": "sent"
+    }
+]
