@@ -1170,10 +1170,8 @@ def build_ui():
         ui_append_text(log_files, "[+] Scheduled Add All to GROUP")
         schedule_coro(add_all_to_group(lbl_status_files, group_link=group_link))
 
-    btn_convert_blocks = Button(frame_files, text="Txt -> JSON Blocks", command=on_convert_blocks_clicked, fg="blue")
-    btn_convert_blocks.pack(pady=6, padx=8, anchor="w")
-    btn_add_users = Button(frame_files, text="Add All Users", command=on_add_users_clicked, fg="blue")
-    btn_add_users.pack(pady=6, padx=8, anchor="w")
+    btn_process_and_add = Button(frame_files, text="Process & Add Users", command=on_process_and_add_clicked, fg="blue")
+    btn_process_and_add.pack(pady=6, padx=8, anchor="w")
 
     # --- Tab 2: Send Messages (kept similar) ---
     frame_send = Frame(notebook)
