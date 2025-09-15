@@ -634,5 +634,9 @@
         "id": 6061953929,
         "status": "failed",
         "message_send": "You can't write in this chat (caused by InviteToChannelRequest)"
+    },
+    {
+        "username": "danchi",
+        "id": 1819892330
     }
 ]
