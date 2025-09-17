@@ -3,6 +3,7 @@ import json
 import random
 import asyncio
 import threading
+import re
 from dotenv import load_dotenv
 from telethon import TelegramClient, errors
 from telethon.tl.functions.channels import InviteToChannelRequest
@@ -244,29 +245,59 @@ def partition_users_evenly(user_list, n_parts):
         parts[idx % n_parts].append(user)
     return parts
 
-def clean_username(raw_username: str) -> str:
-    # Remove spaces, @, URLs, and trailing parts after slash
+def clean_username(raw_username: str) -> str or None:
+    # Normalize username: remove spaces, prefixes, @, validate, lowercase
     username = raw_username.strip()
+    # Remove prefixes
     if username.startswith("https://t.me/"):
         username = username[len("https://t.me/"):]
-    username = username.split()[0]  # take first part if spaces
-    username = username.split("/")[0]  # take first part if slash
+    elif username.startswith("http://t.me/"):
+        username = username[len("http://t.me/"):]
+    elif username.startswith("t.me/"):
+        username = username[len("t.me/"):]
+    # Take first part if spaces or slash
+    username = username.split()[0]
+    username = username.split("/")[0]
+    # Remove @
     username = username.lstrip("@").strip()
+    # Lowercase
+    username = username.lower()
+    # Validate: only letters, numbers, _
+    if not re.match(r'^[a-z0-9_]+$', username):
+        return None
     return username
 
-async def add_users_coordinator(status_label, input_path="process/input/userBase.txt", group_link=GROUP_LINK, selected_client=None):
-    if not clients:
-        ui_update_label(status_label, "No clients available to add users.")
-        return
+def create_pending_from_txt(status_label, input_path="process/input/userBase.txt", pending_path=PENDING_JSON):
     if not os.path.exists(input_path):
         ui_update_label(status_label, f"User base file not found: {input_path}")
         return
-
     with open(input_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
+    usernames = []
+    for line in lines:
+        cleaned = clean_username(line)
+        if cleaned:
+            usernames.append(cleaned)
+    pending_users = [{"username": username} for username in usernames]
+    os.makedirs(os.path.dirname(pending_path), exist_ok=True)
+    with open(pending_path, "w", encoding="utf-8") as f:
+        json.dump(pending_users, f, ensure_ascii=False, indent=4)
+    ui_update_label(status_label, f"Created {pending_path} with {len(pending_users)} users from {input_path}")
 
-    # Clean usernames from lines
-    usernames = [clean_username(line) for line in lines if line.strip()]
+async def add_users_from_pending(status_label, pending_path=PENDING_JSON, group_link=GROUP_LINK, selected_client=None):
+    if not clients:
+        ui_update_label(status_label, "No clients available to add users.")
+        return
+    if not os.path.exists(pending_path):
+        ui_update_label(status_label, f"Pending file not found: {pending_path}. Please create it first.")
+        return
+
+    with open(pending_path, "r", encoding="utf-8") as f:
+        pending_users = json.load(f)
+
+    if not pending_users:
+        ui_update_label(status_label, "No users to process in pending.json")
+        return
 
     # Find the selected client
     selected_client_obj = None
@@ -293,7 +324,6 @@ async def add_users_coordinator(status_label, input_path="process/input/userBase
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     added_path = os.path.join(OUTPUT_DIR, "added.json")
     failed_path = os.path.join(OUTPUT_DIR, "failed.json")
-    noid_path = os.path.join(OUTPUT_DIR, "noid.json")
 
     # Initialize output files if not exist
     if not os.path.exists(added_path):
@@ -302,72 +332,48 @@ async def add_users_coordinator(status_label, input_path="process/input/userBase
     if not os.path.exists(failed_path):
         with open(failed_path, "w", encoding="utf-8") as f:
             json.dump([], f, ensure_ascii=False, indent=4)
-    if not os.path.exists(noid_path):
-        with open(noid_path, "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=4)
 
     # Load existing users to avoid duplicates
     with open(added_path, "r", encoding="utf-8") as f:
         existing_added = json.load(f)
     with open(failed_path, "r", encoding="utf-8") as f:
         existing_failed = json.load(f)
-    with open(noid_path, "r", encoding="utf-8") as f:
-        existing_noid = json.load(f)
 
     added_all = []
     failed_all = []
-    noid_all = []
 
-    for i, username in enumerate(usernames[:], start=1):  # copy to avoid modification issues
-        uid = None
-        try:
-            entity = await selected_client_obj.get_entity(username)
-            uid = entity.id
-            ui_update_label(status_label, f"[{i}/{len(usernames)}] Found ID for {username}: {uid}")
-            # Mark user with id status here
-            for user in existing_added:
-                if user.get("username") == username:
-                    user["status"] = user.get("status", "added")
-                    break
-            for user in existing_failed:
-                if user.get("username") == username:
-                    user["status"] = user.get("status", "failed")
-                    break
-            for user in existing_noid:
-                if user.get("username") == username:
-                    user["status"] = user.get("status", "no id")
-                    break
-        except Exception as e:
-            ui_update_label(status_label, f"[{i}/{len(usernames)}] Failed to get ID for {username}: {e}")
+    total = len(pending_users)
+    i = 0
+    while pending_users:
+        user = pending_users[0]  # process first user
+        username = user.get("username")
+        i += 1
 
-        if not uid:
-            ui_update_label(status_label, f"[{i}/{len(usernames)}] No ID for {username}, adding to noid.json")
-            existing_noid.append({"username": username, "id": None, "status": "no id"})
-            with open(noid_path, "w", encoding="utf-8") as f:
-                json.dump(existing_noid, f, ensure_ascii=False, indent=4)
-            noid_all.append({"username": username, "id": None})
-            # Remove from input
-            lines = [line for line in lines if clean_username(line) != username]
-            with open(input_path, "w", encoding="utf-8") as f:
-                f.writelines(lines)
-            continue
-
+        # Try add
         retries = 0
         added = False
         while retries <= 3:
             try:
-                await selected_client_obj(InviteToChannelRequest(channel=group_entity, users=[uid]))
-                ui_update_label(status_label, f"[{i}/{len(usernames)}] [+] Added {username}")
-                added_all.append({"username": username, "id": uid})
-                existing_added.append({"username": username, "id": uid})
+                await selected_client_obj(InviteToChannelRequest(channel=group_entity, users=[username]))
+                ui_update_label(status_label, f"[{i}/{total}] [+] Added {username}")
+                added_all.append({"username": username})
+                existing_added.append({"username": username})
+                with open(added_path, "w", encoding="utf-8") as f:
+                    json.dump(existing_added, f, ensure_ascii=False, indent=4)
+                added = True
+                break
+            except UserAlreadyParticipantError:
+                ui_update_label(status_label, f"[{i}/{total}] [+] Already in group {username}")
+                added_all.append({"username": username})
+                existing_added.append({"username": username})
                 with open(added_path, "w", encoding="utf-8") as f:
                     json.dump(existing_added, f, ensure_ascii=False, indent=4)
                 added = True
                 break
             except UserPrivacyRestrictedError:
-                ui_update_label(status_label, f"[{i}/{len(usernames)}] [!] Privacy prevents adding {username}")
-                failed_all.append({"username": username, "id": uid})
-                existing_failed.append({"username": username, "id": uid})
+                ui_update_label(status_label, f"[{i}/{total}] [!] Privacy prevents adding {username}")
+                failed_all.append({"username": username})
+                existing_failed.append({"username": username})
                 with open(failed_path, "w", encoding="utf-8") as f:
                     json.dump(existing_failed, f, ensure_ascii=False, indent=4)
                 break
@@ -378,26 +384,26 @@ async def add_users_coordinator(status_label, input_path="process/input/userBase
                 retries += 1
             except Exception as e:
                 ui_update_label(status_label, f"[-] Failed to add {username}: {e}")
-                failed_all.append({"username": username, "id": uid})
-                existing_failed.append({"username": username, "id": uid})
+                failed_all.append({"username": username})
+                existing_failed.append({"username": username})
                 with open(failed_path, "w", encoding="utf-8") as f:
                     json.dump(existing_failed, f, ensure_ascii=False, indent=4)
                 break
         else:
             ui_update_label(status_label, f"[-] Failed {username}: Max retries exceeded")
-            failed_all.append({"username": username, "id": uid})
-            existing_failed.append({"username": username, "id": uid})
+            failed_all.append({"username": username})
+            existing_failed.append({"username": username})
             with open(failed_path, "w", encoding="utf-8") as f:
                 json.dump(existing_failed, f, ensure_ascii=False, indent=4)
 
-        # Remove line from file after processing
-        lines = [line for line in lines if clean_username(line) != username]
-        with open(input_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
+        # Remove from pending in all cases
+        pending_users.pop(0)
+        with open(pending_path, "w", encoding="utf-8") as f:
+            json.dump(pending_users, f, ensure_ascii=False, indent=4)
 
         await asyncio.sleep(random.uniform(1.0, 3.0))  # short delay to respect floodwait
 
-    ui_update_label(status_label, f"Add process finished! Added: {len(added_all)}, Failed: {len(failed_all)}, No ID: {len(noid_all)}")
+    ui_update_label(status_label, f"Add process finished! Added: {len(added_all)}, Failed: {len(failed_all)}")
 
 
 # Fetch existing members
@@ -520,12 +526,16 @@ def schedule_convert(status_label, input_path):
     ui_update_label(status_label, "Starting convert (building json & resolving ids)...")
     schedule_coro(convert_async(status_label, input_path=input_path, output_path=ADDUSERLIST, client_for_lookup=clients[0][0]))
 
-def schedule_add_users(status_label, selected_client=None):
+def schedule_create_pending(status_label):
+    ui_update_label(status_label, "Creating pending from txt...")
+    create_pending_from_txt(status_label)
+
+def schedule_add_from_pending(status_label, selected_client=None):
     if not clients:
         ui_update_label(status_label, "No clients available to add users.")
         return
-    ui_update_label(status_label, "Scheduling add users...")
-    schedule_coro(add_users_coordinator(status_label, input_path="process/input/userBase.txt", group_link=GROUP_LINK, selected_client=selected_client))
+    ui_update_label(status_label, "Scheduling add users from pending...")
+    schedule_coro(add_users_from_pending(status_label, pending_path=PENDING_JSON, group_link=GROUP_LINK, selected_client=selected_client))
 
 def schedule_send_messages(status_label, messages_list, link_text):
     if not clients:
@@ -561,30 +571,28 @@ def build_ui():
     log_add = scrolledtext.ScrolledText(frame_add, height=12)
     log_add.pack(fill="both", padx=8, pady=6, expand=True)
 
-    def on_add_clicked():
+    def on_create_pending_clicked():
+        ui_update_label(lbl_status_add, "Creating pending from txt...")
+        schedule_create_pending(lbl_status_add)
+
+    btn_create_pending = Button(frame_add, text="Create Pending from TXT", command=on_create_pending_clicked)
+    btn_create_pending.pack(pady=6, padx=8, anchor="w")
+
+    def on_add_from_pending_clicked():
         glink = ent_group.get().strip()
         if glink:
             global GROUP_LINK, selected_client
             GROUP_LINK = glink
-            ui_update_label(lbl_status_add, f"Group set to {glink}. Scheduling add...")
-            ui_append_text(log_add, f"[+] Scheduled add to {glink} with client: {selected_client}")
-            schedule_add_users(lbl_status_add, selected_client=selected_client)
+            ui_update_label(lbl_status_add, f"Group set to {glink}. Scheduling add from pending...")
+            ui_append_text(log_add, f"[+] Scheduled add from pending to {glink} with client: {selected_client}")
+            schedule_add_from_pending(lbl_status_add, selected_client=selected_client)
         else:
             ui_update_label(lbl_status_add, "Group link empty.")
 
-    btn_add = Button(frame_add, text="Start Adding Users", command=on_add_clicked)
-    btn_add.pack(pady=6, padx=8, anchor="w")
+    btn_add_from_pending = Button(frame_add, text="Add Users from Pending", command=on_add_from_pending_clicked)
+    btn_add_from_pending.pack(pady=6, padx=8, anchor="w")
 
-    def on_fetch_clicked():
-        glink = ent_group.get().strip()
-        if glink:
-            output_path = os.path.join(OUTPUT_DIR, "alredyin.json")
-            schedule_fetch_existing(lbl_status_add, glink, output_path)
-        else:
-            ui_update_label(lbl_status_add, "Group link empty.")
 
-    btn_fetch = Button(frame_add, text="Fetch Existing Members", command=on_fetch_clicked)
-    btn_fetch.pack(pady=6, padx=8, anchor="w")
 
     # --- Tab 2: Send Messages ---
     frame_send = Frame(notebook)
