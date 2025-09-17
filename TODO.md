@@ -1,3 +1,0 @@
-- [x] Remove the logic in add_users_coordinator that skips users already processed (in added.json, failed.json, noid.json)
-- [x] Remove the except UserAlreadyParticipantError block in add_users_coordinator to treat it as failure
-- [ ] Test the changes to ensure all users with IDs are attempted to be added
