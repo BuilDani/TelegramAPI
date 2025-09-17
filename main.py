@@ -6,7 +6,7 @@ import threading
 from dotenv import load_dotenv
 from telethon import TelegramClient, errors
 from telethon.tl.functions.channels import InviteToChannelRequest
-from telethon.errors import UserPrivacyRestrictedError, FloodWaitError
+from telethon.errors import UserPrivacyRestrictedError, FloodWaitError, UserAlreadyParticipantError
 from tkinter import *
 from tkinter import ttk, scrolledtext, messagebox
 
@@ -244,19 +244,29 @@ def partition_users_evenly(user_list, n_parts):
         parts[idx % n_parts].append(user)
     return parts
 
-async def add_users_coordinator(status_label, pending_path="process/input/userBase.json", group_link=GROUP_LINK, selected_client=None):
+def clean_username(raw_username: str) -> str:
+    # Remove spaces, @, URLs, and trailing parts after slash
+    username = raw_username.strip()
+    if username.startswith("https://t.me/"):
+        username = username[len("https://t.me/"):]
+    username = username.split()[0]  # take first part if spaces
+    username = username.split("/")[0]  # take first part if slash
+    username = username.lstrip("@").strip()
+    return username
+
+async def add_users_coordinator(status_label, input_path="process/input/userBase.txt", group_link=GROUP_LINK, selected_client=None):
     if not clients:
         ui_update_label(status_label, "No clients available to add users.")
         return
-    if not os.path.exists(pending_path):
-        ui_update_label(status_label, f"User base file not found: {pending_path}")
+    if not os.path.exists(input_path):
+        ui_update_label(status_label, f"User base file not found: {input_path}")
         return
 
-    with open(pending_path, "r", encoding="utf-8") as f:
-        user_list = json.load(f)
+    with open(input_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
 
-    # Extract only username and id
-    user_list = [{"username": u.get("username"), "id": u.get("id")} for u in user_list if u.get("username") and u.get("id")]
+    # Clean usernames from lines
+    usernames = [clean_username(line) for line in lines if line.strip()]
 
     # Find the selected client
     selected_client_obj = None
@@ -280,11 +290,9 @@ async def add_users_coordinator(status_label, pending_path="process/input/userBa
         ui_update_label(status_label, f"Could not resolve group {group_link}: {e}")
         return
 
-    ui_update_label(status_label, f"Starting adding {len(user_list)} users with client {selected_client}...")
-
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    added_path = os.path.join(OUTPUT_DIR, "user_added.json")
-    failed_path = os.path.join(OUTPUT_DIR, "user_failed.json")
+    added_path = os.path.join(OUTPUT_DIR, "added.json")
+    failed_path = os.path.join(OUTPUT_DIR, "failed.json")
 
     # Initialize output files if not exist
     if not os.path.exists(added_path):
@@ -297,23 +305,40 @@ async def add_users_coordinator(status_label, pending_path="process/input/userBa
     added_all = []
     failed_all = []
 
-    for i, user in enumerate(user_list, start=1):
-        uid = user.get("id")
-        username = user.get("username")
+    for i, username in enumerate(usernames, start=1):
+        uid = None
+        try:
+            entity = await selected_client_obj.get_entity(username)
+            uid = entity.id
+            ui_update_label(status_label, f"[{i}/{len(usernames)}] Found ID for {username}: {uid}")
+        except Exception as e:
+            ui_update_label(status_label, f"[{i}/{len(usernames)}] Failed to get ID for {username}: {e}")
+
         if not uid:
-            ui_update_label(status_label, f"[{i}/{len(user_list)}] {username} -> no id, skipped")
+            ui_update_label(status_label, f"[{i}/{len(usernames)}] No ID for {username}, skipping add")
+            # Remove line from file
+            lines = [line for line in lines if clean_username(line) != username]
+            with open(input_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
             continue
 
         retries = 0
+        added = False
         while retries <= 3:
             try:
                 await selected_client_obj(InviteToChannelRequest(channel=group_entity, users=[uid]))
-                ui_update_label(status_label, f"[{i}/{len(user_list)}] [+] Added {username}")
-                added_all.append(user)
+                ui_update_label(status_label, f"[{i}/{len(usernames)}] [+] Added {username}")
+                added_all.append({"username": username, "id": uid})
+                added = True
+                break
+            except UserAlreadyParticipantError:
+                ui_update_label(status_label, f"[{i}/{len(usernames)}] [!] {username} is already in the group")
+                added_all.append({"username": username, "id": uid, "status": "already in group"})
+                added = True
                 break
             except UserPrivacyRestrictedError:
-                ui_update_label(status_label, f"[{i}/{len(user_list)}] [!] Privacy prevents adding {username}")
-                failed_all.append(user)
+                ui_update_label(status_label, f"[{i}/{len(usernames)}] [!] Privacy prevents adding {username}")
+                failed_all.append({"username": username, "id": uid})
                 break
             except FloodWaitError as e:
                 wait_time = getattr(e, "seconds", 30)
@@ -321,30 +346,31 @@ async def add_users_coordinator(status_label, pending_path="process/input/userBa
                 await asyncio.sleep(wait_time)
                 retries += 1
             except Exception as e:
-                ui_update_label(status_label, f"[-] Failed {username}: {e}")
-                failed_all.append(user)
+                ui_update_label(status_label, f"[-] Failed to add {username}: {e}")
+                failed_all.append({"username": username, "id": uid})
                 break
         else:
             ui_update_label(status_label, f"[-] Failed {username}: Max retries exceeded")
-            failed_all.append(user)
+            failed_all.append({"username": username, "id": uid})
 
-        # Remove user from userBase.json after processing
-        user_list = [u for u in user_list if u.get("id") != uid]
-        with open(pending_path, "w", encoding="utf-8") as f:
-            json.dump(user_list, f, ensure_ascii=False, indent=4)
+        # Remove line from file after processing
+        lines = [line for line in lines if clean_username(line) != username]
+        with open(input_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
 
         # Save added and failed users
-        with open(added_path, "r", encoding="utf-8") as f:
-            existing_added = json.load(f)
-        existing_added.append(user)
-        with open(added_path, "w", encoding="utf-8") as f:
-            json.dump(existing_added, f, ensure_ascii=False, indent=4)
-
-        with open(failed_path, "r", encoding="utf-8") as f:
-            existing_failed = json.load(f)
-        existing_failed.append(user)
-        with open(failed_path, "w", encoding="utf-8") as f:
-            json.dump(existing_failed, f, ensure_ascii=False, indent=4)
+        if added:
+            with open(added_path, "r", encoding="utf-8") as f:
+                existing_added = json.load(f)
+            existing_added.append({"username": username, "id": uid})
+            with open(added_path, "w", encoding="utf-8") as f:
+                json.dump(existing_added, f, ensure_ascii=False, indent=4)
+        else:
+            with open(failed_path, "r", encoding="utf-8") as f:
+                existing_failed = json.load(f)
+            existing_failed.append({"username": username, "id": uid})
+            with open(failed_path, "w", encoding="utf-8") as f:
+                json.dump(existing_failed, f, ensure_ascii=False, indent=4)
 
         await asyncio.sleep(random.uniform(1.0, 3.0))  # short delay to respect floodwait
 
@@ -446,7 +472,7 @@ def schedule_add_users(status_label, selected_client=None):
         ui_update_label(status_label, "No clients available to add users.")
         return
     ui_update_label(status_label, "Scheduling add users...")
-    schedule_coro(add_users_coordinator(status_label, pending_path="process/input/userBase.json", group_link=GROUP_LINK, selected_client=selected_client))
+    schedule_coro(add_users_coordinator(status_label, input_path="process/input/userBase.txt", group_link=GROUP_LINK, selected_client=selected_client))
 
 def schedule_send_messages(status_label, messages_list, link_text):
     if not clients:
