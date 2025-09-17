@@ -293,6 +293,7 @@ async def add_users_coordinator(status_label, input_path="process/input/userBase
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     added_path = os.path.join(OUTPUT_DIR, "added.json")
     failed_path = os.path.join(OUTPUT_DIR, "failed.json")
+    noid_path = os.path.join(OUTPUT_DIR, "noid.json")
 
     # Initialize output files if not exist
     if not os.path.exists(added_path):
@@ -301,22 +302,51 @@ async def add_users_coordinator(status_label, input_path="process/input/userBase
     if not os.path.exists(failed_path):
         with open(failed_path, "w", encoding="utf-8") as f:
             json.dump([], f, ensure_ascii=False, indent=4)
+    if not os.path.exists(noid_path):
+        with open(noid_path, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False, indent=4)
+
+    # Load existing users to avoid duplicates
+    with open(added_path, "r", encoding="utf-8") as f:
+        existing_added = json.load(f)
+    with open(failed_path, "r", encoding="utf-8") as f:
+        existing_failed = json.load(f)
+    with open(noid_path, "r", encoding="utf-8") as f:
+        existing_noid = json.load(f)
 
     added_all = []
     failed_all = []
+    noid_all = []
 
-    for i, username in enumerate(usernames, start=1):
+    for i, username in enumerate(usernames[:], start=1):  # copy to avoid modification issues
         uid = None
         try:
             entity = await selected_client_obj.get_entity(username)
             uid = entity.id
             ui_update_label(status_label, f"[{i}/{len(usernames)}] Found ID for {username}: {uid}")
+            # Mark user with id status here
+            for user in existing_added:
+                if user.get("username") == username:
+                    user["status"] = user.get("status", "added")
+                    break
+            for user in existing_failed:
+                if user.get("username") == username:
+                    user["status"] = user.get("status", "failed")
+                    break
+            for user in existing_noid:
+                if user.get("username") == username:
+                    user["status"] = user.get("status", "no id")
+                    break
         except Exception as e:
             ui_update_label(status_label, f"[{i}/{len(usernames)}] Failed to get ID for {username}: {e}")
 
         if not uid:
-            ui_update_label(status_label, f"[{i}/{len(usernames)}] No ID for {username}, skipping add")
-            # Remove line from file
+            ui_update_label(status_label, f"[{i}/{len(usernames)}] No ID for {username}, adding to noid.json")
+            existing_noid.append({"username": username, "id": None, "status": "no id"})
+            with open(noid_path, "w", encoding="utf-8") as f:
+                json.dump(existing_noid, f, ensure_ascii=False, indent=4)
+            noid_all.append({"username": username, "id": None})
+            # Remove from input
             lines = [line for line in lines if clean_username(line) != username]
             with open(input_path, "w", encoding="utf-8") as f:
                 f.writelines(lines)
@@ -329,16 +359,17 @@ async def add_users_coordinator(status_label, input_path="process/input/userBase
                 await selected_client_obj(InviteToChannelRequest(channel=group_entity, users=[uid]))
                 ui_update_label(status_label, f"[{i}/{len(usernames)}] [+] Added {username}")
                 added_all.append({"username": username, "id": uid})
-                added = True
-                break
-            except UserAlreadyParticipantError:
-                ui_update_label(status_label, f"[{i}/{len(usernames)}] [!] {username} is already in the group")
-                added_all.append({"username": username, "id": uid, "status": "already in group"})
+                existing_added.append({"username": username, "id": uid})
+                with open(added_path, "w", encoding="utf-8") as f:
+                    json.dump(existing_added, f, ensure_ascii=False, indent=4)
                 added = True
                 break
             except UserPrivacyRestrictedError:
                 ui_update_label(status_label, f"[{i}/{len(usernames)}] [!] Privacy prevents adding {username}")
                 failed_all.append({"username": username, "id": uid})
+                existing_failed.append({"username": username, "id": uid})
+                with open(failed_path, "w", encoding="utf-8") as f:
+                    json.dump(existing_failed, f, ensure_ascii=False, indent=4)
                 break
             except FloodWaitError as e:
                 wait_time = getattr(e, "seconds", 30)
@@ -348,33 +379,55 @@ async def add_users_coordinator(status_label, input_path="process/input/userBase
             except Exception as e:
                 ui_update_label(status_label, f"[-] Failed to add {username}: {e}")
                 failed_all.append({"username": username, "id": uid})
+                existing_failed.append({"username": username, "id": uid})
+                with open(failed_path, "w", encoding="utf-8") as f:
+                    json.dump(existing_failed, f, ensure_ascii=False, indent=4)
                 break
         else:
             ui_update_label(status_label, f"[-] Failed {username}: Max retries exceeded")
             failed_all.append({"username": username, "id": uid})
+            existing_failed.append({"username": username, "id": uid})
+            with open(failed_path, "w", encoding="utf-8") as f:
+                json.dump(existing_failed, f, ensure_ascii=False, indent=4)
 
         # Remove line from file after processing
         lines = [line for line in lines if clean_username(line) != username]
         with open(input_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
-        # Save added and failed users
-        if added:
-            with open(added_path, "r", encoding="utf-8") as f:
-                existing_added = json.load(f)
-            existing_added.append({"username": username, "id": uid})
-            with open(added_path, "w", encoding="utf-8") as f:
-                json.dump(existing_added, f, ensure_ascii=False, indent=4)
-        else:
-            with open(failed_path, "r", encoding="utf-8") as f:
-                existing_failed = json.load(f)
-            existing_failed.append({"username": username, "id": uid})
-            with open(failed_path, "w", encoding="utf-8") as f:
-                json.dump(existing_failed, f, ensure_ascii=False, indent=4)
-
         await asyncio.sleep(random.uniform(1.0, 3.0))  # short delay to respect floodwait
 
-    ui_update_label(status_label, f"Add process finished! Added: {len(added_all)}, Failed: {len(failed_all)}")
+    ui_update_label(status_label, f"Add process finished! Added: {len(added_all)}, Failed: {len(failed_all)}, No ID: {len(noid_all)}")
+
+
+# Fetch existing members
+
+async def fetch_existing_members_async(client_obj, group_link, output_path):
+    try:
+        group_entity = await client_obj.get_entity(group_link)
+        participants = await client_obj.get_participants(group_entity)
+        members = [{"id": p.id, "username": p.username or ""} for p in participants]
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(members, f, ensure_ascii=False, indent=4)
+        return len(members)
+    except Exception as e:
+        raise e
+
+async def fetch_existing_members_coordinator(status_label, group_link, output_path):
+    if not clients:
+        ui_update_label(status_label, "No clients available to fetch members.")
+        return
+    client_obj = clients[0][0]
+    try:
+        count = await fetch_existing_members_async(client_obj, group_link, output_path)
+        ui_update_label(status_label, f"Fetched {count} members to {output_path}")
+    except Exception as e:
+        ui_update_label(status_label, f"Error fetching members: {e}")
+
+def schedule_fetch_existing(status_label, group_link, output_path):
+    ui_update_label(status_label, "Scheduling fetch existing members...")
+    schedule_coro(fetch_existing_members_coordinator(status_label, group_link, output_path))
 
 
 # Send messages
@@ -521,6 +574,17 @@ def build_ui():
 
     btn_add = Button(frame_add, text="Start Adding Users", command=on_add_clicked)
     btn_add.pack(pady=6, padx=8, anchor="w")
+
+    def on_fetch_clicked():
+        glink = ent_group.get().strip()
+        if glink:
+            output_path = os.path.join(OUTPUT_DIR, "alredyin.json")
+            schedule_fetch_existing(lbl_status_add, glink, output_path)
+        else:
+            ui_update_label(lbl_status_add, "Group link empty.")
+
+    btn_fetch = Button(frame_add, text="Fetch Existing Members", command=on_fetch_clicked)
+    btn_fetch.pack(pady=6, padx=8, anchor="w")
 
     # --- Tab 2: Send Messages ---
     frame_send = Frame(notebook)
